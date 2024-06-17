@@ -12,42 +12,42 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 import numpy as np
 from typing import Optional
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 
-def drop_path_f(x, drop_prob: float = 0., training: bool = False):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+# def drop_path_f(x, drop_prob: float = 0., training: bool = False):
+#     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
-    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
-    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
-    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
-    'survival rate' as the argument.
+#     This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+#     the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+#     See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+#     changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+#     'survival rate' as the argument.
 
-    """
-    if drop_prob == 0. or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-    random_tensor.floor_()  # binarize
-    output = x.div(keep_prob) * random_tensor
-    return output
+#     """
+#     if drop_prob == 0. or not training:
+#         return x
+#     keep_prob = 1 - drop_prob
+#     shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+#     random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+#     random_tensor.floor_()  # binarize
+#     output = x.div(keep_prob) * random_tensor
+#     return output
 
 
-class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
-    """
-    def __init__(self, drop_prob=None):
-        super(DropPath, self).__init__()
-        self.drop_prob = drop_prob
+# class DropPath(nn.Module):
+#     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+#     """
+#     def __init__(self, drop_prob=None):
+#         super(DropPath, self).__init__()
+#         self.drop_prob = drop_prob
 
-    def forward(self, x):
-        return drop_path_f(x, self.drop_prob, self.training)
+#     def forward(self, x):
+#         return drop_path_f(x, self.drop_prob, self.training)
 
 
 def window_partition(x, window_size: int):
     """
-    将feature map按照window_size划分成一个个没有重叠的window
     Args:
         x: (B, H, W, C)
         window_size (int): window size(M)
@@ -65,7 +65,6 @@ def window_partition(x, window_size: int):
 
 def window_reverse(windows, window_size: int, H: int, W: int):
     """
-    将一个个window还原成一个feature map
     Args:
         windows: (num_windows*B, window_size, window_size, C)
         window_size (int): Window size(M)
@@ -108,20 +107,7 @@ class Mlp(nn.Module):
 
 
 class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
-
-    Args:
-        dim (int): Number of input channels.
-        window_size (tuple[int]): The height and width of the window.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
-        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
-    """
-
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
-
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # [Mh, Mw]
@@ -156,36 +142,20 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, Mh*Mw, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        # [batch_size*num_windows, Mh*Mw, total_embed_dim]
         B_, N, C = x.shape
-        # qkv(): -> [batch_size*num_windows, Mh*Mw, 3 * total_embed_dim]
-        # reshape: -> [batch_size*num_windows, Mh*Mw, 3, num_heads, embed_dim_per_head]
-        # permute: -> [3, batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
-        # [batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
 
-        # transpose: -> [batch_size*num_windows, num_heads, embed_dim_per_head, Mh*Mw]
-        # @: multiply -> [batch_size*num_windows, num_heads, Mh*Mw, Mh*Mw]
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        # relative_position_bias_table.view: [Mh*Mw*Mh*Mw,nH] -> [Mh*Mw,Mh*Mw,nH]
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # [nH, Mh*Mw, Mh*Mw]
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
-            # mask: [nW, Mh*Mw, Mh*Mw]
             nW = mask.shape[0]  # num_windows
-            # attn.view: [batch_size, num_windows, num_heads, Mh*Mw, Mh*Mw]
-            # mask.unsqueeze: [1, nW, 1, Mh*Mw, Mh*Mw]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
@@ -194,12 +164,15 @@ class WindowAttention(nn.Module):
 
         attn = self.attn_drop(attn)
 
-        # @: multiply -> [batch_size*num_windows, num_heads, Mh*Mw, embed_dim_per_head]
-        # transpose: -> [batch_size*num_windows, Mh*Mw, num_heads, embed_dim_per_head]
-        # reshape: -> [batch_size*num_windows, Mh*Mw, total_embed_dim]
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        try:
+            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+        except Exception as e: 
+            attn = attn.to(dtype=x.dtype)
+            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
         return x
 
 
@@ -251,7 +224,6 @@ class SwinTransformerBlock(nn.Module):
         x = x.view(B, H, W, C)
 
         # pad feature maps to multiples of window size
-        # 把feature map给pad到window size的整数倍
         pad_l = pad_t = 0
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
@@ -283,7 +255,6 @@ class SwinTransformerBlock(nn.Module):
             x = shifted_x
 
         if pad_r > 0 or pad_b > 0:
-            # 把前面pad的数据移除掉
             x = x[:, :H, :W, :].contiguous()
 
         x = x.view(B, H * W, C)
@@ -295,7 +266,7 @@ class SwinTransformerBlock(nn.Module):
         return x
 
 
-class SwinStage(nn.Module):
+class SwinTransformer(nn.Module):
     """
     A basic Swin Transformer layer for one stage.
 
@@ -316,7 +287,7 @@ class SwinStage(nn.Module):
 
     def __init__(self, dim, c2, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, use_checkpoint=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
         super().__init__()
         assert dim==c2, r"no. in/out channel should be same"
         self.dim = dim
@@ -339,14 +310,15 @@ class SwinStage(nn.Module):
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer)
             for i in range(depth)])
-
+        if downsample is not None:
+            self.downsample = downsample(c2, dim=dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
 
     def create_mask(self, x, H, W):
         # calculate attention mask for SW-MSA
-        # 保证Hp和Wp是window_size的整数倍
         Hp = int(np.ceil(H / self.window_size)) * self.window_size
         Wp = int(np.ceil(W / self.window_size)) * self.window_size
-        # 拥有和feature map一样的通道排列顺序，方便后续window_partition
         img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # [1, Hp, Wp, 1]
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
@@ -401,7 +373,6 @@ class PatchEmbed(nn.Module):
         _, _, H, W = x.shape
 
         # padding
-        # 如果输入图片的H，W不是patch_size的整数倍，需要进行padding
         pad_input = (H % self.patch_size[0] != 0) or (W % self.patch_size[1] != 0)
         if pad_input:
             # to pad the last 3 dimensions,
@@ -410,7 +381,6 @@ class PatchEmbed(nn.Module):
                           0, self.patch_size[0] - H % self.patch_size[0],
                           0, 0))
 
-        # 下采样patch_size倍
         x = self.proj(x)
         B, C, H, W = x.shape
         # flatten: [B, C, H, W] -> [B, C, HW]
@@ -449,12 +419,10 @@ class PatchMerging(nn.Module):
         # x = x.view(B, H*W, C)
 
         # padding
-        # 如果输入feature map的H，W不是2的整数倍，需要进行padding
         pad_input = (H % 2 == 1) or (W % 2 == 1)
         if pad_input:
             # to pad the last 3 dimensions, starting from the last dimension and moving forward.
             # (C_front, C_back, W_left, W_right, H_top, H_bottom)
-            # 注意这里的Tensor通道是[B, H, W, C]，所以会和官方文档有些不同
             x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
 
         x0 = x[:, 0::2, 0::2, :]  # [B, H/2, W/2, C]

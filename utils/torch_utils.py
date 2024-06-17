@@ -63,6 +63,13 @@ def smart_DDP(model):
         return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
 
 
+def time_synchronized():
+    # pytorch-accurate time
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()
+
+
 def reshape_classifier_output(model, n=1000):
     # Update a TorchVision classification model to class count 'n' if required
     from models.common import Classify
