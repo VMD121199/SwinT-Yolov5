@@ -24,7 +24,7 @@ import json
 import os
 import sys
 from pathlib import Path
-
+import gc
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -194,19 +194,21 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, (im, ir, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
             if cuda:
                 im = im.to(device, non_blocking=True)
+                ir = ir.to(device, non_blocking=True).float()
                 targets = targets.to(device)
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
+            ir /= 255
             nb, _, height, width = im.shape  # batch size, channels, height, width
-
+        im_test = torch.cat([im, ir], dim=1)
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            preds, train_out = model(im_test) if compute_loss else (model(im_test, augment=augment), None)
 
         # Loss
         if compute_loss:

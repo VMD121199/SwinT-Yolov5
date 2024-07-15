@@ -102,6 +102,20 @@ LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = check_git_info()
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    if not torch.distributed.is_initialized():
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+def cleanup():
+    dist.destroy_process_group()
 
 layer_mapping = {
     0: 1, # +1 if layer is downsamples
@@ -239,12 +253,11 @@ def train(hyp, opt, device, callbacks):
         )
         model.load_state_dict(state_dict, strict=False) # load
         # LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
-        # freeze_layer = [str(i) for i in range(8)]
-        # for k, v in model.named_parameters():
-        #     i = k.split(".")[1]
-        #     if str(i) in freeze_layer:
-        #         print(f"Set {k} to freeze")
-        #         v.requires_grad = False #freeze Swin
+        freeze_layer = [str(i) for i in range(8)]
+        for k, v in model.named_parameters():
+            i = k.split(".")[1]
+            if str(i) in freeze_layer:
+                v.requires_grad = False #freeze Swin
         LOGGER.info(
                 "Transferred %g/%g items from %s"
                 % (len(state_dict), len(model.state_dict()), weights)
@@ -312,7 +325,7 @@ def train(hyp, opt, device, callbacks):
     # Trainloader
     train_loader, dataset = create_dataloader(train_path,
                                               imgsz,
-                                              batch_size // WORLD_SIZE,
+                                              batch_size,
                                               gs,
                                               single_cls,
                                               hyp=hyp,
@@ -324,7 +337,8 @@ def train(hyp, opt, device, callbacks):
                                               image_weights=opt.image_weights,
                                               quad=opt.quad,
                                               prefix=colorstr('train: '),
-                                              shuffle=True)
+                                              shuffle=True, 
+                                              mm=opt.mm)
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"
@@ -342,7 +356,8 @@ def train(hyp, opt, device, callbacks):
                                        rank=-1,
                                        workers=workers * 2,
                                        pad=0.5,
-                                       prefix=colorstr('val: '))[0]
+                                       prefix=colorstr('val: '),
+                                       mm=opt.mm)[0]
 
         if not resume:
             if not opt.noautoanchor:
@@ -353,6 +368,7 @@ def train(hyp, opt, device, callbacks):
 
     # DDP mode
     if cuda and RANK != -1:
+        ddp_setup(RANK, world_size=torch.cuda.device_count())
         model = smart_DDP(model)
 
     # Model attributes
@@ -389,10 +405,22 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_train_epoch_start")
         # with torch.autocast("cuda"): 
         model.train()
-        if epoch == 10:
-            print("Unfreeze all layers")
-            for k, v in model.named_parameters():
-                v.requires_grad = True  # train all layers
+        # if (simpretrained or pretrained) and epoch < 50: # make sure the layers are frozen
+        #     assert model.named_parameters().__next__()[1].requires_grad == False, "Layer should be frozen"
+        # if epoch == 50:
+        #     print("Unfreeze backbone layers, Freeze head layers")
+        #     for k, v in model.named_parameters():
+        #         v.requires_grad = True  # train all layers
+        #     freeze_layer = [str(i) for i in range(8)]
+        #     for k, v in model.named_parameters():
+        #         i = k.split(".")[1]
+        #         if str(i) not in freeze_layer:
+        #             v.requires_grad = False #freeze Detect Head
+        # if epoch == 40:
+        #     print("Unfreeze all layers")
+        #     for k, v in model.named_parameters():
+        #         v.requires_grad = True
+
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
@@ -411,11 +439,12 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (rgbs, irs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+            rgb_image = rgbs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            ir_image = irs.to(device, non_blocking=True).float() / 255.0 #zjq
+            
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -430,10 +459,14 @@ def train(hyp, opt, device, callbacks):
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs  # size
-                sf = sz / max(imgs.shape[2:])  # scale factor
+                sf = sz / max(rgb_image.shape[2:])  # scale factor
                 if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                    ns = [math.ceil(x * sf / gs) * gs for x in rgb_image.shape[2:]]  # new shape (stretched to gs-multiple)
+                    rgb_image = F.interpolate(rgb_image, size=ns, mode="bilinear", align_corners=False)
+                    ir_image = F.interpolate(ir_image, size=ns, mode="bilinear", align_corners=False)
+
+            # fusion rgb and ir image
+            imgs = torch.cat([rgb_image, ir_image], dim=1)
 
             # Forward
             with torch.cuda.amp.autocast(enabled=cuda):
@@ -464,9 +497,9 @@ def train(hyp, opt, device, callbacks):
                 mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], rgb_image.shape[-1])
                 )
-                callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
+                callbacks.run("on_train_batch_end", model, ni, rgb_image, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
@@ -578,6 +611,7 @@ def parse_opt(known=False):
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=300, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
+    parser.add_argument("--mm", type=bool, default=False, help="multimodal")
     parser.add_argument(
         "--train_img_size",
         type=int,
@@ -619,7 +653,7 @@ def parse_opt(known=False):
     parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
-    parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+    parser.add_argument("--local-rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")
